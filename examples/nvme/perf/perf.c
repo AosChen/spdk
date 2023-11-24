@@ -120,6 +120,7 @@ struct ns_worker_stats {
 	uint64_t		idle_tsc;
 	uint64_t		last_busy_tsc;
 	uint64_t		last_idle_tsc;
+	bool			is_counting;
 };
 
 struct ns_worker_ctx {
@@ -185,6 +186,18 @@ struct worker_thread {
 	unsigned			lcore;
 };
 
+struct token_bucket {
+	uint32_t m_token_per_unit;
+	int32_t m_max_tokens;
+	uint32_t m_usec_per_unit;
+	uint64_t m_start_time;
+	uint64_t m_state;
+	uint64_t m_freq;
+	uint64_t m_cur_usec;
+	uint32_t m_cur_token;
+};
+static struct token_bucket* g_token_bucket = NULL;
+static bool UseToken();
 struct ns_fn_table {
 	void	(*setup_payload)(struct perf_task *task, uint8_t pattern);
 
@@ -247,6 +260,9 @@ static bool g_header_digest;
 static bool g_data_digest;
 static bool g_no_shn_notification;
 static bool g_mix_specified;
+
+static uint64_t g_max_iops;
+static uint32_t g_max_tokens;
 /* The flag is used to exit the program while keep alive fails on the transport */
 static bool g_exit;
 /* Default to 10 seconds for the keep alive value. This value is arbitrary. */
@@ -266,6 +282,10 @@ static uint8_t g_transport_tos = 0;
 
 static uint32_t g_rdma_srq_size;
 uint8_t *g_psk = NULL;
+
+uint64_t completed_num_total = 0;
+uint64_t completed_num_count = 0;
+uint64_t max_completed_num = 0;
 
 /* When user specifies -Q, some error messages are rate limited.  When rate
  * limited, we only print the error message every g_quiet_count times the
@@ -1492,8 +1512,14 @@ submit_single_io(struct perf_task *task)
 	} else {
 		task->is_read = false;
 	}
-
-	rc = entry->fn_table->submit_io(task, ns_ctx, entry, offset_in_ios);
+	if (UseToken())
+	{
+		rc = entry->fn_table->submit_io(task, ns_ctx, entry, offset_in_ios);
+	}
+	else
+	{
+		rc = -1;
+	}
 
 	if (spdk_unlikely(rc != 0)) {
 		if (g_continue_on_error) {
@@ -1607,10 +1633,9 @@ allocate_task(struct ns_worker_ctx *ns_ctx, int queue_depth)
 }
 
 static void
-submit_io(struct ns_worker_ctx *ns_ctx, int queue_depth)
+submit_io(struct ns_worker_ctx *ns_ctx, int queue_depth, int sleep_thread_id)
 {
 	struct perf_task *task;
-
 	while (queue_depth-- > 0) {
 		task = allocate_task(ns_ctx, queue_depth);
 		submit_single_io(task);
@@ -1743,7 +1768,11 @@ work_fn(void *arg)
 
 	/* Submit initial I/O for each namespace. */
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
-		submit_io(ns_ctx, g_queue_depth);
+		submit_io(ns_ctx, g_queue_depth, worker->lcore);
+		ns_ctx->stats.idle_tsc = 0;
+		ns_ctx->stats.busy_tsc = 0;
+		ns_ctx->stats.last_tsc = 0;
+		ns_ctx->stats.is_counting = false;
 	}
 
 	while (spdk_likely(!g_exit)) {
@@ -1775,7 +1804,6 @@ work_fn(void *arg)
 				ns_ctx->stats.idle_tsc += check_now - ns_ctx->stats.last_tsc;
 			}
 			ns_ctx->stats.last_tsc = check_now;
-
 			if (!ns_ctx->is_draining) {
 				all_draining = false;
 			}
@@ -1794,7 +1822,9 @@ work_fn(void *arg)
 
 		if (tsc_current > tsc_end) {
 			if (warmup) {
-				/* Update test start and end time, clear statistics */
+				/* Update test start and end time, clear statistics */ 
+				completed_num_total = 0;
+				completed_num_count = 0;
 				tsc_start = spdk_get_ticks();
 				tsc_end = tsc_start + g_time_in_sec * g_tsc_rate;
 
@@ -1815,7 +1845,7 @@ work_fn(void *arg)
 			}
 		}
 	}
-
+	printf("Break from while loop\n");
 	/* Capture the actual elapsed time when we break out of the main loop. This will account
 	 * for cases where we exit prematurely due to a signal. We only need to capture it on
 	 * one core, so use the main core.
@@ -1847,7 +1877,6 @@ work_fn(void *arg)
 			}
 		}
 	} while (unfinished_ns_ctx > 0);
-
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 		cleanup_ns_worker_ctx(ns_ctx);
 	}
@@ -2066,6 +2095,10 @@ print_performance(void)
 		       max_strlen + 13, "Total", total_io_per_second, total_mb_per_second,
 		       sum_ave_latency, min_latency_so_far, max_latency_so_far);
 		printf("\n");
+		printf("========================================================\n");
+		double avg_num_comp = (double)completed_num_total / completed_num_count;
+		printf("Avg num completed io is: %10.2f\n", avg_num_comp);
+		printf("The max completed io in: %lld\n", max_completed_num);
 	}
 
 	if (g_latency_sw_tracking_level == 0 || total_io_completed == 0) {
@@ -2474,6 +2507,10 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"rdma-srq-size", required_argument, NULL, PERF_RDMA_SRQ_SIZE},
 #define PERF_USE_EVERY_CORE	269
 	{"use-every-core", no_argument, NULL, PERF_USE_EVERY_CORE},
+#define PERF_MAX_IOPS 270
+	{"max-iops", required_argument, NULL, PERF_MAX_IOPS},
+#define PERF_MAX_TOKENS 271
+	{"max-tokens", required_argument, NULL, PERF_MAX_TOKENS},
 	/* Should be the last element */
 	{0, 0, 0, 0}
 };
@@ -2508,6 +2545,8 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		case PERF_IO_QUEUE_SIZE:
 		case PERF_ZEROCOPY_THRESHOLD:
 		case PERF_RDMA_SRQ_SIZE:
+		case PERF_MAX_IOPS:
+		case PERF_MAX_TOKENS:
 			val = spdk_strtol(optarg, 10);
 			if (val < 0) {
 				fprintf(stderr, "Converting a string to integer failed\n");
@@ -2573,6 +2612,12 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 				break;
 			case PERF_RDMA_SRQ_SIZE:
 				g_rdma_srq_size = val;
+				break;
+			case PERF_MAX_IOPS:
+				g_max_iops = val;
+				break;
+			case PERF_MAX_TOKENS:
+				g_max_tokens = val;
 				break;
 			}
 			break;
@@ -3000,6 +3045,74 @@ register_controllers(void)
 }
 
 static void
+register_tokenbucket(void)
+{
+	g_token_bucket = malloc(sizeof(struct token_bucket));
+	g_token_bucket->m_start_time = spdk_get_ticks();
+	g_token_bucket->m_freq = g_tsc_rate;
+	g_token_bucket->m_state = 0;
+	g_token_bucket->m_cur_usec = 0;
+	g_token_bucket->m_cur_token = 0;	
+	if (g_max_tokens != 0)
+	{
+		g_token_bucket->m_max_tokens = g_max_tokens;
+	}
+	else if (g_max_iops * 10L > (uint32_t)(-1))
+	{
+		g_token_bucket->m_max_tokens = (uint32_t)(-1);
+	}
+	else
+	{
+		g_token_bucket->m_max_tokens = g_max_iops * 10L;
+	}
+	uint32_t usec_per_unit = 1000000, tokens_per_unit = g_max_iops;
+	while(g_max_iops > 0 && usec_per_unit > 0 && (tokens_per_unit % 5 == 0) && (usec_per_unit % 5 == 0))
+	{
+		tokens_per_unit /= 5;
+		usec_per_unit /= 5;
+	}
+	while(g_max_iops > 0 && usec_per_unit > 0 && (tokens_per_unit % 2 == 0) && (usec_per_unit % 2 == 0))
+	{
+		tokens_per_unit /= 2;
+		usec_per_unit /= 2;
+	}
+	g_token_bucket->m_token_per_unit = tokens_per_unit; // 2
+	g_token_bucket->m_usec_per_unit = usec_per_unit; // 1
+}
+
+static bool
+UseToken()
+{
+	uint64_t cur_token = g_token_bucket->m_cur_token;
+	uint64_t cur_usec = g_token_bucket->m_cur_usec;
+	uint32_t token_per_unit = g_token_bucket->m_token_per_unit;
+	uint32_t usec_per_unit = g_token_bucket->m_usec_per_unit;
+	if (token_per_unit == 0)
+	{
+		return true;
+	}
+	if (cur_token > 0)
+	{
+		g_token_bucket->m_cur_token--;
+		return true;
+	}
+	uint64_t new_usec = (spdk_get_ticks() - g_token_bucket->m_start_time) * 1000000 / g_tsc_rate;
+	uint64_t delta_unit = (new_usec - cur_usec) / usec_per_unit;
+	if (delta_unit == 0)
+	{
+		return false;
+	}
+	cur_token += delta_unit * token_per_unit;
+	if (cur_token > g_token_bucket->m_max_tokens)
+	{
+		cur_token = g_token_bucket->m_max_tokens;
+	}
+	g_token_bucket->m_cur_usec = new_usec;
+	g_token_bucket->m_cur_token = cur_token - 1;
+	return true;
+}
+
+static void
 unregister_controllers(void)
 {
 	struct ctrlr_entry *entry, *tmp;
@@ -3226,6 +3339,8 @@ main(int argc, char **argv)
 		rc = -1;
 		goto cleanup;
 	}
+
+	register_tokenbucket();
 
 	if (g_warn) {
 		printf("WARNING: Some requested NVMe devices were skipped\n");

@@ -24,6 +24,10 @@ static struct spdk_nvme_pcie_stat g_dummy_stat = {};
 static void nvme_pcie_fail_request_bad_vtophys(struct spdk_nvme_qpair *qpair,
 		struct nvme_tracker *tr);
 
+extern uint64_t completed_num_total;
+extern uint64_t completed_num_count;
+extern uint64_t max_completed_num;
+
 static inline uint64_t
 nvme_pcie_vtophys(struct spdk_nvme_ctrlr *ctrlr, const void *buf, uint64_t *size)
 {
@@ -944,6 +948,11 @@ nvme_pcie_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 	}
 
 	if (num_completions > 0) {
+		if (spdk_unlikely(num_completions > max_completed_num)) {
+			max_completed_num = num_completions;
+		}
+		completed_num_total += num_completions;
+		completed_num_count += 1;
 		pqpair->stat->completions += num_completions;
 		nvme_pcie_qpair_ring_cq_doorbell(qpair);
 	} else {

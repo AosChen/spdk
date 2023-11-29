@@ -1529,7 +1529,7 @@ submit_single_io(struct perf_task *task)
 			/* We can't just resubmit here or we can get in a loop that
 			 * stack overflows. */
 			//TAILQ_INSERT_TAIL(&ns_ctx->queued_tasks, task, link);
-			ns_ctx->perf_task[ns_ctx->perf_index++] = &task;
+			ns_ctx->perf_task[ns_ctx->perf_index++] = task;
 		} else {
 			RATELIMIT_LOG("starting I/O failed: %d\n", rc);
 			spdk_dma_free(task->iovs[0].iov_base);

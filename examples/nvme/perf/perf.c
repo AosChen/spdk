@@ -129,6 +129,8 @@ struct ns_worker_ctx {
 	uint64_t		current_queue_depth;
 	uint64_t		offset_in_ios;
 	int             index;
+	struct perf_task	*perf_task;
+	int				perf_index;
 	bool			is_draining;
 
 	union {
@@ -1526,7 +1528,8 @@ submit_single_io(struct perf_task *task)
 		if (g_continue_on_error) {
 			/* We can't just resubmit here or we can get in a loop that
 			 * stack overflows. */
-			TAILQ_INSERT_TAIL(&ns_ctx->queued_tasks, task, link);
+			//TAILQ_INSERT_TAIL(&ns_ctx->queued_tasks, task, link);
+			ns_ctx->perf_task[ns_ctx->perf_index++] = &task;
 		} else {
 			RATELIMIT_LOG("starting I/O failed: %d\n", rc);
 			spdk_dma_free(task->iovs[0].iov_base);
@@ -1749,6 +1752,8 @@ work_fn(void *arg)
 			return 1;
 		}
 		ns_ctx->index = index++;
+		ns_ctx->perf_task = malloc(sizeof(struct perf_task) * g_queue_depth);
+		ns_ctx->perf_index = 0;
 	}
 
 	rc = pthread_barrier_wait(&g_worker_sync_barrier);
@@ -1788,13 +1793,24 @@ work_fn(void *arg)
 		 */
 		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 			if (g_continue_on_error) {
-				/* Submit any I/O that is queued up */
-				TAILQ_INIT(&swap);
-				TAILQ_SWAP(&swap, &ns_ctx->queued_tasks, perf_task, link);
-				while (!TAILQ_EMPTY(&swap)) {
-					task = TAILQ_FIRST(&swap);
-					TAILQ_REMOVE(&swap, task, link);
+				// /* Submit any I/O that is queued up */
+				// TAILQ_INIT(&swap);
+				// TAILQ_SWAP(&swap, &ns_ctx->queued_tasks, perf_task, link);
+				// while (!TAILQ_EMPTY(&swap)) {
+				// 	task = TAILQ_FIRST(&swap);
+				// 	TAILQ_REMOVE(&swap, task, link);
+				// 	submit_single_io(task);
+				// }
+				while (ns_ctx->perf_index > 0)
+				{
+					int cur_i = ns_ctx->perf_index;
+					task = ns_ctx->perf_task[--ns_ctx->perf_index];
 					submit_single_io(task);
+					if (ns_ctx->perf_index == cur_i)
+					{
+						break;
+					}
+					
 				}
 			}
 

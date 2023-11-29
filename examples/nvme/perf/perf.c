@@ -128,6 +128,7 @@ struct ns_worker_ctx {
 	struct ns_worker_stats	stats;
 	uint64_t		current_queue_depth;
 	uint64_t		offset_in_ios;
+	int             index;
 	bool			is_draining;
 
 	union {
@@ -196,8 +197,8 @@ struct token_bucket {
 	uint64_t m_cur_usec;
 	uint32_t m_cur_token;
 };
-static struct token_bucket* g_token_bucket = NULL;
-static bool UseToken();
+static struct token_bucket** g_token_bucket = NULL;
+static bool UseToken(int i);
 struct ns_fn_table {
 	void	(*setup_payload)(struct perf_task *task, uint8_t pattern);
 
@@ -1512,7 +1513,7 @@ submit_single_io(struct perf_task *task)
 	} else {
 		task->is_read = false;
 	}
-	if (UseToken())
+	if (UseToken(ns_ctx->index))
 	{
 		rc = entry->fn_table->submit_io(task, ns_ctx, entry, offset_in_ios);
 	}
@@ -1738,12 +1739,14 @@ work_fn(void *arg)
 	struct perf_task *task;
 
 	/* Allocate queue pairs for each namespace. */
+	int index = 0;
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 		if (init_ns_worker_ctx(ns_ctx) != 0) {
 			printf("ERROR: init_ns_worker_ctx() failed\n");
 			/* Wait on barrier to avoid blocking of successful workers */
 			pthread_barrier_wait(&g_worker_sync_barrier);
 			ns_ctx->status = 1;
+			ns_ctx->index = index++;
 			return 1;
 		}
 	}
@@ -3047,68 +3050,70 @@ register_controllers(void)
 static void
 register_tokenbucket(void)
 {
-	g_token_bucket = malloc(sizeof(struct token_bucket));
-	g_token_bucket->m_start_time = spdk_get_ticks();
-	g_token_bucket->m_freq = g_tsc_rate;
-	g_token_bucket->m_state = 0;
-	g_token_bucket->m_cur_usec = 0;
-	g_token_bucket->m_cur_token = 0;	
-	if (g_max_tokens != 0)
-	{
-		g_token_bucket->m_max_tokens = g_max_tokens;
+	g_token_bucket = malloc(sizeof(struct token_bucket)*6);
+	for(int i = 0;i < 6;i++){
+		g_token_bucket[i]->m_start_time = spdk_get_ticks();
+		g_token_bucket[i]->m_freq = g_tsc_rate;
+		g_token_bucket[i]->m_state = 0;
+		g_token_bucket[i]->m_cur_usec = 0;
+		g_token_bucket[i]->m_cur_token = 0;	
+		if (g_max_tokens != 0)
+		{
+			g_token_bucket[i]->m_max_tokens = g_max_tokens;
+		}
+		else if (g_max_iops * 10L > (uint32_t)(-1))
+		{
+			g_token_bucket[i]->m_max_tokens = (uint32_t)(-1);
+		}
+		else
+		{
+			g_token_bucket[i]->m_max_tokens = g_max_iops * 10L;
+		}
+		uint32_t usec_per_unit = 1000000, tokens_per_unit = g_max_iops;
+		while(g_max_iops > 0 && usec_per_unit > 0 && (tokens_per_unit % 5 == 0) && (usec_per_unit % 5 == 0))
+		{
+			tokens_per_unit /= 5;
+			usec_per_unit /= 5;
+		}
+		while(g_max_iops > 0 && usec_per_unit > 0 && (tokens_per_unit % 2 == 0) && (usec_per_unit % 2 == 0))
+		{
+			tokens_per_unit /= 2;
+			usec_per_unit /= 2;
+		}
+		g_token_bucket[i]->m_token_per_unit = tokens_per_unit; // 2
+		g_token_bucket[i]->m_usec_per_unit = usec_per_unit; // 1
 	}
-	else if (g_max_iops * 10L > (uint32_t)(-1))
-	{
-		g_token_bucket->m_max_tokens = (uint32_t)(-1);
-	}
-	else
-	{
-		g_token_bucket->m_max_tokens = g_max_iops * 10L;
-	}
-	uint32_t usec_per_unit = 1000000, tokens_per_unit = g_max_iops;
-	while(g_max_iops > 0 && usec_per_unit > 0 && (tokens_per_unit % 5 == 0) && (usec_per_unit % 5 == 0))
-	{
-		tokens_per_unit /= 5;
-		usec_per_unit /= 5;
-	}
-	while(g_max_iops > 0 && usec_per_unit > 0 && (tokens_per_unit % 2 == 0) && (usec_per_unit % 2 == 0))
-	{
-		tokens_per_unit /= 2;
-		usec_per_unit /= 2;
-	}
-	g_token_bucket->m_token_per_unit = tokens_per_unit; // 2
-	g_token_bucket->m_usec_per_unit = usec_per_unit; // 1
 }
 
 static bool
-UseToken()
+UseToken(int i)
 {
-	uint64_t cur_token = g_token_bucket->m_cur_token;
-	uint64_t cur_usec = g_token_bucket->m_cur_usec;
-	uint32_t token_per_unit = g_token_bucket->m_token_per_unit;
-	uint32_t usec_per_unit = g_token_bucket->m_usec_per_unit;
+	uint64_t cur_token = g_token_bucket[i]->m_cur_token;
+	uint64_t cur_usec = g_token_bucket[i]->m_cur_usec;
+	uint32_t token_per_unit = g_token_bucket[i]->m_token_per_unit;
+	uint32_t usec_per_unit = g_token_bucket[i]->m_usec_per_unit;
 	if (token_per_unit == 0)
 	{
 		return true;
 	}
 	if (cur_token > 0)
 	{
-		g_token_bucket->m_cur_token--;
+		g_token_bucket[i]->m_cur_token--;
 		return true;
 	}
-	uint64_t new_usec = (spdk_get_ticks() - g_token_bucket->m_start_time) * 1000000 / g_tsc_rate;
+	uint64_t new_usec = (spdk_get_ticks() - g_token_bucket[i]->m_start_time) * 1000000 / g_tsc_rate;
 	uint64_t delta_unit = (new_usec - cur_usec) / usec_per_unit;
 	if (delta_unit == 0)
 	{
 		return false;
 	}
 	cur_token += delta_unit * token_per_unit;
-	if (cur_token > g_token_bucket->m_max_tokens)
+	if (cur_token > g_token_bucket[i]->m_max_tokens)
 	{
-		cur_token = g_token_bucket->m_max_tokens;
+		cur_token = g_token_bucket[i]->m_max_tokens;
 	}
-	g_token_bucket->m_cur_usec = new_usec;
-	g_token_bucket->m_cur_token = cur_token - 1;
+	g_token_bucket[i]->m_cur_usec = new_usec;
+	g_token_bucket[i]->m_cur_token = cur_token - 1;
 	return true;
 }
 

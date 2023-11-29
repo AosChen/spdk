@@ -129,7 +129,7 @@ struct ns_worker_ctx {
 	uint64_t		current_queue_depth;
 	uint64_t		offset_in_ios;
 	int             index;
-	struct perf_task	*perf_task;
+	struct perf_task	**perf_task;
 	int				perf_index;
 	bool			is_draining;
 
@@ -1752,7 +1752,11 @@ work_fn(void *arg)
 			return 1;
 		}
 		ns_ctx->index = index++;
-		ns_ctx->perf_task = malloc(sizeof(struct perf_task) * g_queue_depth);
+		ns_ctx->perf_task = malloc(sizeof(struct perf_task*) * g_queue_depth);
+		//for (size_t i = 0; i < g_queue_depth; i++)
+		//{
+		//	ns_ctx->perf_task[i] = malloc(sizeof(struct perf_task));
+		//}
 		ns_ctx->perf_index = 0;
 	}
 

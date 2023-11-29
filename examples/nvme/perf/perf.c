@@ -1746,9 +1746,9 @@ work_fn(void *arg)
 			/* Wait on barrier to avoid blocking of successful workers */
 			pthread_barrier_wait(&g_worker_sync_barrier);
 			ns_ctx->status = 1;
-			ns_ctx->index = index++;
 			return 1;
 		}
+		ns_ctx->index = index++;
 	}
 
 	rc = pthread_barrier_wait(&g_worker_sync_barrier);
@@ -3050,8 +3050,9 @@ register_controllers(void)
 static void
 register_tokenbucket(void)
 {
-	g_token_bucket = malloc(sizeof(struct token_bucket)*6);
+	g_token_bucket = malloc(sizeof(struct token_bucket*)*6);
 	for(int i = 0;i < 6;i++){
+		g_token_bucket[i] = malloc(sizeof(struct token_bucket));
 		g_token_bucket[i]->m_start_time = spdk_get_ticks();
 		g_token_bucket[i]->m_freq = g_tsc_rate;
 		g_token_bucket[i]->m_state = 0;
